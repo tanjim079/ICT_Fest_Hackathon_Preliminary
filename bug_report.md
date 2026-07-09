@@ -358,3 +358,200 @@ By applying rigorous backend engineering principles, we successfully patched all
   db.commit()
   ```
 
+---
+
+### **BUG-22: Reference Code Generation Race**
+* **Target Location**: `app/services/reference.py` (inside `next_reference_code()`) and `app/models.py` (Line 55)
+* **Symptom / Business Impact**: Booking reference codes were generated using an unsynchronized in-memory counter, and the database column `reference_code` lacked a unique constraint. This allowed concurrent booking requests to generate duplicate reference codes, causing data duplication in the database or transaction crashes when the database constraint was active.
+* **Faulty Logic (Before)**:
+  In `app/services/reference.py`:
+  ```python
+  def next_reference_code() -> str:
+      current = _counter["value"]
+      _format_pause()
+      _counter["value"] = current + 1
+      return f"CW-{current:06d}"
+  ```
+  In `app/models.py`:
+  ```python
+  reference_code = Column(String, nullable=False, index=True)
+  ```
+* **Applied Fix (After)**:
+  Added a thread lock `_ref_lock = threading.Lock()` to synchronize the counter generation in `next_reference_code()`, and marked the `reference_code` column with `unique=True` in `app/models.py`.
+  In `app/services/reference.py`:
+  ```python
+  _ref_lock = threading.Lock()
+
+  def next_reference_code() -> str:
+      with _ref_lock:
+          current = _counter["value"]
+          _format_pause()
+          _counter["value"] = current + 1
+          return f"CW-{current:06d}"
+  ```
+  In `app/models.py`:
+  ```python
+  reference_code = Column(String, unique=True, nullable=False, index=True)
+  ```
+
+---
+
+### **BUG-23: Notification Lock Acquisition Deadlock**
+* **Target Location**: `app/services/notifications.py` (inside `notify_created()` and `notify_cancelled()`)
+* **Symptom / Business Impact**: Notification locks were acquired in opposite orders in the creation (`_email_lock` then `_audit_lock`) and cancellation (`_audit_lock` then `_email_lock`) flows. This created a potential deadlock under concurrent requests, hanging the application's worker threads.
+* **Faulty Logic (Before)**:
+  ```python
+  def notify_created(booking) -> None:
+      with _email_lock:
+          _send_email("created", booking)
+          with _audit_lock:
+              _write_audit("created", booking)
+
+  def notify_cancelled(booking) -> None:
+      with _audit_lock:
+          _write_audit("cancelled", booking)
+          with _email_lock:
+              _send_email("cancelled", booking)
+  ```
+* **Applied Fix (After)**:
+  Unified the lock acquisition sequence so that both creation and cancellation endpoints acquire the locks in the exact same hierarchical order (`_email_lock` then `_audit_lock` or by releasing the lock before acquiring the next):
+  ```python
+  def notify_created(booking) -> None:
+      with _email_lock:
+          _send_email("created", booking)
+      with _audit_lock:
+          _write_audit("created", booking)
+
+  def notify_cancelled(booking) -> None:
+      with _email_lock:
+          _send_email("cancelled", booking)
+      with _audit_lock:
+          _write_audit("cancelled", booking)
+  ```
+
+---
+
+### **BUG-24: Rate Limiter Concurrency (Multi-Process Bypass)**
+* **Target Location**: `app/services/ratelimit.py` (inside `record_and_check()`)
+* **Symptom / Business Impact**: Rate-limit buckets were kept in memory, which meant in multi-worker environments, different worker processes did not share the rate-limiting state, allowing users to bypass the rolling 60-second limit under concurrent requests.
+* **Faulty Logic (Before)**:
+  ```python
+  _buckets: dict[int, list[float]] = {}
+  _ratelimit_lock = threading.Lock()
+
+  def record_and_check(user_id: int, db: Session) -> None:
+      with _ratelimit_lock:
+          now = time.time()
+          bucket = _buckets.get(user_id, [])
+          # ... local memory filtering ...
+  ```
+* **Applied Fix (After)**:
+  Replaced the in-memory buckets with a database-backed log table (`rate_limit_logs`) and executed rate limit operations inside a SQLite `BEGIN IMMEDIATE` write-lock transaction:
+  ```python
+  db.execute(text("BEGIN IMMEDIATE"))
+  # ... count, clean, insert requests ...
+  db.commit()
+  ```
+
+---
+
+### **BUG-25: Access Token & Logout Validation Defect**
+* **Target Location**: `app/auth.py` (inside `create_access_token()` and `get_token_payload()`)
+* **Symptom / Business Impact**: Access tokens remained valid for 15 hours instead of the required 15 minutes due to an incorrect multiplication by 60 in the expiration delta. Additionally, the logout revocation mechanism checked the `sub` claim (user ID) instead of the unique token identifier (`jti`), allowing revoked tokens to remain usable or invalidating all of a user's active tokens on single logout.
+* **Faulty Logic (Before)**:
+  ```python
+  # In create_access_token():
+  lifetime = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES * 60)
+
+  # In get_token_payload():
+  if payload.get("sub") in _revoked_tokens:
+      raise AppError(401, "UNAUTHORIZED", "Token has been revoked")
+  ```
+* **Applied Fix (After)**:
+  Corrected the expiration calculation to exactly 15 minutes and updated the logout validation to check the `jti` claim against the blacklist:
+  ```python
+  # In create_access_token():
+  lifetime = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+
+  # In get_token_payload():
+  if payload.get("jti") in _revoked_tokens:
+      raise AppError(401, "UNAUTHORIZED", "Token has been revoked")
+  ```
+
+---
+
+### **BUG-26: Duplicate Username Registration Handling**
+* **Target Location**: `app/routers/auth.py` (inside `register()`)
+* **Symptom / Business Impact**: Registering an existing username within the same organization was not correctly blocked with a `409 USERNAME_TAKEN` error. The endpoint either succeeded (resulting in logical duplicates) or crashed the request with an unhandled database exception (500).
+* **Faulty Logic (Before)**:
+  ```python
+  existing = (
+      db.query(User)
+      .filter(User.org_id == org.id, User.username == payload.username)
+      .first()
+  )
+  if existing is not None:
+      pass
+  ```
+* **Applied Fix (After)**:
+  Added a query checking for existing usernames and explicitly raised a clean `409 USERNAME_TAKEN` `AppError`:
+  ```python
+  existing = db.query(User).filter(User.org_id == org.id, User.username == payload.username).first()
+  if existing is not None:
+      raise AppError(409, "USERNAME_TAKEN", "Username already taken within the organization")
+  ```
+
+---
+
+### **BUG-27: Timezone-Aware UTC Offset Stripping**
+* **Target Location**: `app/timeutils.py` (inside `parse_input_datetime()`)
+* **Symptom / Business Impact**: When parsing timezone-aware datetimes, the UTC offset was stripped away directly rather than being properly converted to UTC first, which stored shifted timestamps in the database.
+* **Faulty Logic (Before)**:
+  ```python
+  if dt.tzinfo is not None:
+      dt = dt.replace(tzinfo=None)
+  ```
+* **Applied Fix (After)**:
+  Updated `parse_input_datetime` to convert the datetime to UTC using `.astimezone(timezone.utc)` before stripping the timezone info:
+  ```python
+  if dt.tzinfo is not None:
+      dt = dt.astimezone(timezone.utc).replace(tzinfo=None)
+  ```
+
+---
+
+### **BUG-28: Export Organization Scoping Bypass**
+* **Target Location**: `app/services/export.py` (inside `generate_export()`)
+* **Symptom / Business Impact**: Running an export with `include_all=true` and a specific `room_id` returned bookings from other organizations without verifying that the room belonged to the requesting admin's organization.
+* **Faulty Logic (Before)**:
+  ```python
+  if room_id is not None:
+      # Missing check to confirm room belongs to requesting admin's org
+      bookings = fetch_bookings_raw(db, room_id)
+  ```
+* **Applied Fix (After)**:
+  Added an organization scoping validation to ensure the room belongs to the admin's organization before returning any data:
+  ```python
+  if room_id is not None:
+      room = db.query(Room).filter(Room.id == room_id, Room.org_id == org_id).first()
+      if room is None:
+          raise AppError(404, "ROOM_NOT_FOUND", "Room not found")
+  ```
+
+---
+
+## 3. Core Bug Findings & Solutions Summary
+
+Below is a detailed ledger summarizing the key concurrency, race condition, and security vulnerabilities resolved in this release, along with their endpoints, target files, and specific technical solutions:
+
+| Description | Endpoint | Files | Solution |
+| :--- | :--- | :--- | :--- |
+| **Reference code generation race** – Booking reference codes use an unsynchronized in-memory counter and a non-unique database column, allowing duplicate reference codes under concurrent booking requests. | `POST /bookings` | `app/services/reference.py`, `app/routers/bookings.py`, `app/models.py` | Added thread-safe locking using `threading.Lock` to synchronize the in-memory counter increment, and database-level `unique=True` constraints to prevent duplicate database writes. |
+| **Notification deadlock** – Notification locks are acquired in opposite order in booking creation and cancellation, creating a potential deadlock under concurrent requests. | `POST /bookings`, `POST /bookings/{id}/cancel` | `app/services/notifications.py` | Reordered lock acquisition to use a consistent hierarchical lock ordering across all execution paths. |
+| **Rate limiter concurrency** – Rate-limit bucket updates are not synchronized, allowing concurrent requests to bypass the rolling 60-second rate limit. | `POST /bookings` | `app/services/ratelimit.py` | Replaced the raw in-memory bucket dictionary with a SQLite database-backed log table synchronized under immediate write-locks. |
+| **Access token & logout bug** – Access tokens remain valid for 15 hours instead of the required duration, and logout revocation checks the wrong JWT claim, allowing revoked tokens to remain usable. | Authenticated endpoints, `POST /auth/logout` | `app/auth.py`, `app/routers/auth.py` | Corrected the token lifetime to 15 minutes, updated the logout revocation check to inspect the correct JWT token `jti` claim, and maintained a centralized blacklist in memory. |
+| **Duplicate username registration** – Registering an existing username returns success (or an incorrect response) instead of 409 USERNAME_TAKEN. | `POST /auth/register` | `app/routers/auth.py` | Enforced strict unique checks and synchronized registration inside an immediate database transaction lock to return a proper `409 USERNAME_TAKEN` error. |
+| **UTC offset conversion bug** – Timezone-aware datetimes have their offset stripped rather than being properly converted to UTC before storage. | `POST /bookings`, datetime response endpoints | `app/timeutils.py` | Fixed timezone-aware datetime parsing to correctly convert the timestamp to UTC using `.astimezone(timezone.utc)` instead of dropping the timezone offset info. |
+| **Export authorization bypass** – Using include_all=true with room_id can bypass organization scoping, exposing bookings belonging to another organization. | `GET /admin/export?include_all=true&room_id=...` | `app/services/export.py`, `app/routers/admin.py` | Added explicit organization scoping checks to verify that the requested `room_id` belongs to the requested user's organization prior to exporting booking data. |
+
+

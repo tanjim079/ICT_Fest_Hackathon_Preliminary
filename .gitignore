@@ -4,3 +4,7 @@ __pycache__/
 .venv/
 venv/
 .pytest_cache/
+bug_report.xlsx
+Dockerfile
+make_bug_report.py
+.dockerignore
