@@ -7,6 +7,7 @@ import threading
 import time
 
 _counter = {"value": 1000}
+_ref_lock = threading.Lock()
 _lock = threading.Lock()
 
 
@@ -17,6 +18,11 @@ def _format_pause() -> None:
 
 
 def next_reference_code() -> str:
+    with _ref_lock:
+        current = _counter["value"]
+        _format_pause()
+        _counter["value"] = current + 1
+        return f"CW-{current:06d}"
     with _lock:
         current = _counter["value"]
         _format_pause()

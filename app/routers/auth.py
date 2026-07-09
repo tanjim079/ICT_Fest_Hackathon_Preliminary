@@ -1,5 +1,6 @@
 """Authentication endpoints: register, login, refresh, logout."""
 from fastapi import APIRouter, Depends
+from sqlalchemy import text
 from sqlalchemy.orm import Session
 
 from ..auth import (
@@ -8,6 +9,7 @@ from ..auth import (
     decode_token,
     get_token_payload,
     hash_password,
+    is_token_revoked,
     revoke_access_token,
     verify_password,
 )
@@ -21,6 +23,7 @@ router = APIRouter(prefix="/auth", tags=["auth"])
 
 @router.post("/register", status_code=201)
 def register(payload: RegisterRequest, db: Session = Depends(get_db)):
+    db.execute(text("BEGIN IMMEDIATE"))
     org = db.query(Organization).filter(Organization.name == payload.org_name).first()
     role = "admin" if org is None else "member"
     if org is None:
@@ -35,6 +38,7 @@ def register(payload: RegisterRequest, db: Session = Depends(get_db)):
         .first()
     )
     if existing is not None:
+        raise AppError(409, "USERNAME_TAKEN", "Username already taken within the organization")
         raise AppError(409, "USERNAME_TAKEN", "Username is already taken")
 
     user = User(
@@ -78,9 +82,15 @@ def refresh(payload: RefreshRequest, db: Session = Depends(get_db)):
     data = decode_token(payload.refresh_token)
     if data.get("type") != "refresh":
         raise AppError(401, "UNAUTHORIZED", "Wrong token type")
+    if is_token_revoked(data.get("jti")):
+        raise AppError(401, "UNAUTHORIZED", "Token has been revoked")
     user = db.query(User).filter(User.id == int(data["sub"])).first()
     if user is None:
         raise AppError(401, "UNAUTHORIZED", "Unknown user")
+    
+    # Invalidate the presented refresh token (single-use constraint)
+    revoke_access_token(data)
+    
     return {
         "access_token": create_access_token(user),
         "refresh_token": create_refresh_token(user),
