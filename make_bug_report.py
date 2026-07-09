@@ -61,7 +61,7 @@ ws1.row_dimensions[1].height = 36
 
 # Sub-title
 ws1.merge_cells("A2:F2")
-s = ws1.cell(row=2, column=1, value="Total bugs found & fixed: 17   |   Smoke tests: PASSED ✅")
+s = ws1.cell(row=2, column=1, value="Total bugs found & fixed: 20   |   Smoke tests: PASSED ✅")
 s.font = Font(name="Calibri", bold=True, size=11, color=C_H2_FG)
 s.fill = PatternFill("solid", fgColor=C_H2_BG)
 s.alignment = Alignment(horizontal="center", vertical="center")
@@ -94,12 +94,13 @@ rows = [
     ("Booking — availability cache is not invalidated when a booking is cancelled", "BUG-15", "routers/bookings.py", "🐛 Bug", "✅ Fixed"),
     ("Booking — usage report cache is not invalidated when a booking is created", "BUG-16", "routers/bookings.py", "🐛 Bug", "✅ Fixed"),
     ("Booking — usage report cache is not invalidated when a room is created", "BUG-17", "routers/rooms.py", "🐛 Bug", "✅ Fixed"),
+    ("Booking — notification lock acquisition deadlock",        "BUG-18", "services/notifications.py", "🐛 Bug", "✅ Fixed"),
+    ("DateTime — timezone-aware UTC offset stripped instead of converted", "BUG-19", "timeutils.py", "🐛 Bug", "✅ Fixed"),
+    ("Export — include_all scoping bypass exposes other org bookings", "BUG-20", "services/export.py", "🐛 Bug", "✅ Fixed"),
     ("Login — credential validation logic",                     "—",      "routers/auth.py",     "✅ OK",  "N/A"),
     ("Rate Limiting — rolling 60-second window",                "—",      "services/ratelimit.py","✅ OK", "N/A"),
     ("Refund Formula — half-up rounding",                       "—",      "services/refunds.py", "✅ OK",  "N/A"),
-    ("DateTime UTC — parse & output with +00:00",               "—",      "timeutils.py",        "✅ OK",  "N/A"),
     ("Admin Report — includes rooms with zero bookings",        "—",      "routers/admin.py",    "✅ OK",  "N/A"),
-    ("Export CSV — org-scoped, admin-only, UTC timestamps",     "—",      "services/export.py",  "✅ OK",  "N/A"),
 ]
 
 for ri, (desc, bug_id, file_, status, fixed) in enumerate(rows, 4):
@@ -211,6 +212,18 @@ details = [
     ("BUG-17","Room / Cache Invalidation","routers/rooms.py","L56 · create_room()",
      "When a room is created, the usage report cache for the organization was not invalidated, keeping the new room off the report until the cache aged out.",
      "Added cache.invalidate_report(admin.org_id) to create_room.","✅ Fixed"),
+
+    ("BUG-18","Booking / Concurrency","services/notifications.py","L24-36 · notify_created() / notify_cancelled()",
+     "Simulated email and audit log locks were acquired in opposite orders in the creation and cancellation paths. Under concurrent load, this could trigger circular-wait deadlocks, freezing the server process.",
+     "Unified the locking order in both routines to always acquire _email_lock before _audit_lock.","✅ Fixed"),
+
+    ("BUG-19","DateTime","timeutils.py","L13 · parse_input_datetime()",
+     "For timezone-aware datetimes, the offset was stripped (replaced with None) instead of correctly converting the datetime to UTC. This caused incorrect dates and times to be stored for non-UTC input.",
+     "Changed the offset check to use astimezone(timezone.utc) before removing tzinfo.","✅ Fixed"),
+
+    ("BUG-20","Export / Security","services/export.py","L44-53 · generate_export()",
+     "Specifying include_all=true with a room_id bypassed the organization scoping checks, leaking booking details from other organizations.",
+     "Enforced room ownership validation checking Room.org_id == org_id before executing raw room queries.","✅ Fixed"),
 ]
 
 for ri, row in enumerate(details, 3):
@@ -247,9 +260,12 @@ ws3.row_dimensions[2].height = 18
 
 file_data = [
     ("app/routers/bookings.py", 13, "BUG-01, BUG-02, BUG-03, BUG-04, BUG-05, BUG-06, BUG-07, BUG-08, BUG-09, BUG-10, BUG-13, BUG-15, BUG-16"),
-    ("app/routers/rooms.py",     1, "BUG-17"),
+    ("app/routers/rooms.py",     2, "BUG-17"),
     ("app/routers/auth.py",      2, "BUG-11, BUG-14"),
     ("app/services/stats.py",    1, "BUG-12"),
+    ("app/services/notifications.py", 1, "BUG-18"),
+    ("app/timeutils.py",         1, "BUG-19"),
+    ("app/services/export.py",   1, "BUG-20"),
 ]
 for ri, (f, n, ids) in enumerate(file_data, 3):
     ws3.row_dimensions[ri].height = 20

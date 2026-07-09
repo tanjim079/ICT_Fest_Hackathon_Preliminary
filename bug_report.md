@@ -6,7 +6,7 @@
 
 ## 1. Executive Summary & Architectural Overview
 
-This document presents a comprehensive diagnostic and resolution report for the **17 architectural, logical, and concurrency bugs** discovered within the CoWork API application. 
+This document presents a comprehensive diagnostic and resolution report for the **20 architectural, logical, and concurrency bugs** discovered within the CoWork API application. 
 
 By applying rigorous backend engineering principles, we successfully patched all vulnerabilities and logical deviations while strictly preserving the original API path schema, response field names, and status codes.
 
@@ -54,7 +54,7 @@ By applying rigorous backend engineering principles, we successfully patched all
 
 ### **BUG-03: Non-strict Booking Overlap Predicate**
 * **Target Location**: `app/routers/bookings.py` (Line 50, inside `_has_conflict()`)
-* **Symptom / Business Impact**: The overlap calculation used non-strict comparisons (`<=` and `>=`), treating back-to-back bookings (e.g., Booking A: 10:00–11:00; Booking B: 11:00–12:00) as overlapping and rejecting them with a `409 ROOM_CONFLICT`. This violated the rule: *"Back-to-back bookings (one ending exactly when the other starts) are allowed."*
+* **Symptom / Business Impact**: The overlap calculation used non-strict comparisons (`<=` and `/>=`), treating back-to-back bookings (e.g., Booking A: 10:00–11:00; Booking B: 11:00–12:00) as overlapping and rejecting them with a `409 ROOM_CONFLICT`. This violated the rule: *"Back-to-back bookings (one ending exactly when the other starts) are allowed."*
 * **Faulty Logic (Before)**:
   ```python
   for b in existing:
@@ -289,3 +289,51 @@ By applying rigorous backend engineering principles, we successfully patched all
   cache.invalidate_report(admin.org_id)
   ```
 
+---
+
+### **BUG-18: Notification Lock Acquisition Deadlock**
+* **Target Location**: `app/services/notifications.py` (Lines 24–36, inside `notify_created()` and `notify_cancelled()`)
+* **Symptom / Business Impact**: Under concurrent booking creation and cancellation, thread executions could acquire the email lock and audit lock in opposite orders. This creates a circular-wait deadlock causing worker threads to hang indefinitely, violating: *"Liveness. ... no combination of concurrent valid requests may hang the service."*
+* **Faulty Logic (Before)**:
+  `notify_created` acquired `_email_lock` then `_audit_lock`.
+  `notify_cancelled` acquired `_audit_lock` then `_email_lock`.
+* **Applied Fix (After)**:
+  Unified the lock acquisition sequence to always acquire `_email_lock` before `_audit_lock` in both function paths:
+  ```python
+  def notify_cancelled(booking) -> None:
+      with _email_lock:
+          _send_email("cancelled", booking)
+      with _audit_lock:
+          _write_audit("cancelled", booking)
+  ```
+
+---
+
+### **BUG-19: Timezone-Aware DateTime Offset Stripping**
+* **Target Location**: `app/timeutils.py` (Line 13, inside `parse_input_datetime()`)
+* **Symptom / Business Impact**: Input datetimes with explicit timezone offsets had their offsets discarded (`replace(tzinfo=None)`) rather than being converted to UTC. This shifted saved bookings by the offset amount, violating: *"Input datetimes carrying a UTC offset are converted to UTC before storage or comparison; naive input is treated as UTC."*
+* **Faulty Logic (Before)**:
+  ```python
+  if dt.tzinfo is not None:
+      dt = dt.replace(tzinfo=None)
+  ```
+* **Applied Fix (After)**:
+  ```python
+  if dt.tzinfo is not None:
+      dt = dt.astimezone(timezone.utc).replace(tzinfo=None)
+  ```
+
+---
+
+### **BUG-20: Export Organization Scoping Bypass**
+* **Target Location**: `app/services/export.py` (Lines 44–53, inside `generate_export()`)
+* **Symptom / Business Impact**: When calling `GET /admin/export` with `include_all=true` and a `room_id`, the system loaded all bookings for that room without checking if the room belonged to the caller's organization. This allowed admins to download bookings from other organizations, violating strict multi-tenancy bounds.
+* **Faulty Logic (Before)**:
+  No room ownership validation was run before calling `fetch_bookings_raw(db, room_id)`.
+* **Applied Fix (After)**:
+  ```python
+  if room_id is not None:
+      room = db.query(Room).filter(Room.id == room_id, Room.org_id == org_id).first()
+      if room is None:
+          raise AppError(404, "ROOM_NOT_FOUND", "Room not found")
+  ```
