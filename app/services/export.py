@@ -1,9 +1,11 @@
 """CSV export of bookings for administrators."""
 import csv
 import io
+from typing import Optional
 
 from sqlalchemy.orm import Session
 
+from ..errors import AppError
 from ..models import Booking, Room
 from ..timeutils import iso_utc
 
@@ -29,7 +31,7 @@ def fetch_bookings_raw(db: Session, room_id: int) -> list[Booking]:
     )
 
 
-def _fetch_scoped(db: Session, org_id: int, user_id: int | None, room_id: int | None) -> list[Booking]:
+def _fetch_scoped(db: Session, org_id: int, user_id: Optional[int], room_id: Optional[int]) -> list[Booking]:
     query = db.query(Booking).join(Room).filter(Room.org_id == org_id)
     if user_id is not None:
         query = query.filter(Booking.user_id == user_id)
@@ -42,9 +44,13 @@ def generate_export(
     db: Session,
     org_id: int,
     user_id: int,
-    room_id: int | None,
+    room_id: Optional[int],
     include_all: bool,
 ) -> str:
+    if room_id is not None:
+        room = db.query(Room).filter(Room.id == room_id, Room.org_id == org_id).first()
+        if room is None:
+            raise AppError(404, "ROOM_NOT_FOUND", "Room not found")
     if include_all:
         if room_id is not None:
             rows = fetch_bookings_raw(db, room_id)
