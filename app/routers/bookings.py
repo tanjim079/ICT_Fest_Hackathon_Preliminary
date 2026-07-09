@@ -79,7 +79,7 @@ def create_booking(
     db: Session = Depends(get_db),
     user: User = Depends(get_current_user),
 ):
-    ratelimit.record_and_check(user.id)
+    ratelimit.record_and_check(user.id, db)
 
     start = parse_input_datetime(payload.start_time)
     end = parse_input_datetime(payload.end_time)
